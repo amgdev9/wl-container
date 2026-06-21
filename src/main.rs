@@ -1,18 +1,14 @@
-#![allow(improper_ctypes, non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code)]
+#![allow(improper_ctypes, non_camel_case_types, non_upper_case_globals, non_snake_case)]
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 use std::ffi::{CStr, CString};
-use std::fs::File;
-use std::io::{pipe, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::io::pipe;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-// ---------------------------------------------------------------------------
-// Registry listener globals (set from C callback)
-// ---------------------------------------------------------------------------
 static GLOBAL_MANAGER_NAME: AtomicU32 = AtomicU32::new(0);
 static GLOBAL_MANAGER_VERSION: AtomicU32 = AtomicU32::new(0);
 
@@ -43,85 +39,53 @@ const REGISTRY_LISTENER: wl_registry_listener = wl_registry_listener {
     global_remove: Some(registry_global_remove),
 };
 
-// ---------------------------------------------------------------------------
+static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_signal(_: i32) {
+    SHOULD_EXIT.store(true, Ordering::SeqCst);
+}
+
 fn usage() {
     eprintln!(
         concat!(
-            "Usage: wl-container [OPTIONS] --socket-fd SOCKET_FD\n",
-            "       wl-container [OPTIONS] --socket-path SOCKET_PATH\n\n",
-            "Create Wayland security context at SOCKET_FD\n",
+            "Usage: wl-container [OPTIONS] SOCKET_PATH\n\n",
+            "Create Wayland security context at SOCKET_PATH\n",
             "\t-e ENGINE    Engine ID for security context\n",
             "\t-a APP_ID    App ID for security context\n",
             "\t-i INSTANCE  Instance ID for security context\n",
-            "\t-c FD        Stop listening when FD closes\n",
-            "\t-r FD        Notify readiness on FD\n",
             "\t-h           Show help and exit\n",
-            "\nSee 'man wl-container' for details.",
         )
     );
 }
 
-// ---------------------------------------------------------------------------
-// Argument parsing
-// ---------------------------------------------------------------------------
 fn parse_args() -> Result<Args, String> {
     let mut raw: Vec<String> = std::env::args().collect();
     raw.remove(0);
-    let mut a = Args::default();
+
+    let mut sandbox_engine = None;
+    let mut app_id = None;
+    let mut instance_id = None;
 
     let mut i = 0;
     while i < raw.len() {
         match raw[i].as_str() {
-            "-s" | "--socket-fd" => {
-                i += 1;
-                a.socket_fd = Some(
-                    raw.get(i)
-                        .ok_or("--socket-fd requires a value")?
-                        .parse::<RawFd>()
-                        .map_err(|_| "invalid fd")?,
-                );
-            }
-            "-S" | "--socket-path" => {
-                i += 1;
-                a.socket_path = Some(
-                    PathBuf::from(raw.get(i).ok_or("--socket-path requires a value")?),
-                );
-            }
             "-e" | "--sandbox-engine" => {
                 i += 1;
                 let v = raw.get(i).ok_or("--sandbox-engine requires a value")?;
-                a.sandbox_engine =
+                sandbox_engine =
                     Some(CString::new(v.as_bytes()).map_err(|_| "engine name contains null byte")?);
             }
             "-a" | "--app-id" => {
                 i += 1;
                 let v = raw.get(i).ok_or("--app-id requires a value")?;
-                a.app_id =
+                app_id =
                     Some(CString::new(v.as_bytes()).map_err(|_| "app-id contains null byte")?);
             }
             "-i" | "--instance-id" => {
                 i += 1;
                 let v = raw.get(i).ok_or("--instance-id requires a value")?;
-                a.instance_id = Some(
+                instance_id = Some(
                     CString::new(v.as_bytes()).map_err(|_| "instance-id contains null byte")?,
-                );
-            }
-            "-c" | "--close-fd" => {
-                i += 1;
-                a.close_fd = Some(
-                    raw.get(i)
-                        .ok_or("--close-fd requires a value")?
-                        .parse::<RawFd>()
-                        .map_err(|_| "invalid fd")?,
-                );
-            }
-            "-r" | "--ready-fd" => {
-                i += 1;
-                a.ready_fd = Some(
-                    raw.get(i)
-                        .ok_or("--ready-fd requires a value")?
-                        .parse::<RawFd>()
-                        .map_err(|_| "invalid fd")?,
                 );
             }
             "-h" | "--help" => {
@@ -131,53 +95,33 @@ fn parse_args() -> Result<Args, String> {
             other if other.starts_with('-') => {
                 return Err(format!("unexpected argument: {other}"));
             }
-            _ => {
-                return Err(format!("unexpected positional argument: {}", raw[i]));
-            }
+            _ => break,
         }
         i += 1;
     }
-    Ok(a)
+
+    let path = raw.get(i).ok_or("missing SOCKET_PATH")?;
+    i += 1;
+
+    if i < raw.len() {
+        return Err(format!("unexpected positional argument: {}", raw[i]));
+    }
+
+    Ok(Args {
+        socket_path: PathBuf::from(path),
+        sandbox_engine,
+        app_id,
+        instance_id,
+    })
 }
 
 struct Args {
-    socket_fd: Option<RawFd>,
-    socket_path: Option<PathBuf>,
+    socket_path: PathBuf,
     sandbox_engine: Option<CString>,
     app_id: Option<CString>,
     instance_id: Option<CString>,
-    close_fd: Option<RawFd>,
-    ready_fd: Option<RawFd>,
 }
 
-impl Default for Args {
-    fn default() -> Self {
-        Self {
-            socket_fd: None,
-            socket_path: None,
-            sandbox_engine: None,
-            app_id: None,
-            instance_id: None,
-            close_fd: None,
-            ready_fd: None,
-        }
-    }
-}
-
-impl Args {
-    fn validate(&self) -> Result<(), String> {
-        match (self.socket_fd, &self.socket_path) {
-            (Some(_), None) => Ok(()),
-            (None, Some(_)) => Ok(()),
-            (None, None) => Err("No socket fd or socket path specified".into()),
-            (Some(_), Some(_)) => Err("Cannot use both socket fd and socket path".into()),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Wayland helpers — each wraps wl_proxy_marshal_array_flags with typed args
-// ---------------------------------------------------------------------------
 unsafe fn display_get_registry(display: *mut wl_display) -> *mut wl_registry {
     let version = wl_proxy_get_version(display as *mut wl_proxy);
     let mut args = [wl_argument { n: 0 }];
@@ -270,7 +214,6 @@ unsafe fn manager_destroy(mgr: *mut wl_proxy) {
     wl_proxy_marshal_array_flags(mgr, WP_SECURITY_CONTEXT_MANAGER_V1_DESTROY, std::ptr::null(), v, WL_MARSHAL_FLAG_DESTROY, std::ptr::null_mut());
 }
 
-// ---------------------------------------------------------------------------
 unsafe fn create_context(
     listen_fd: RawFd,
     close_fd: RawFd,
@@ -339,51 +282,52 @@ unsafe fn create_context(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
+struct Socket {
+    path: PathBuf,
+    _listener: OwnedFd,
+}
+
+impl Socket {
+    fn new(path: PathBuf) -> Result<Self, String> {
+        let listener = UnixListener::bind(&path).map_err(|e| format!("binding socket: {e}"))?;
+        let _listener = OwnedFd::from(listener);
+        Ok(Self { path, _listener })
+    }
+
+    fn listen_fd(&self) -> RawFd {
+        self._listener.as_raw_fd()
+    }
+}
+
+impl Drop for Socket {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 fn main() {
+    unsafe {
+        libc::signal(libc::SIGINT, handle_signal as *const () as usize);
+        libc::signal(libc::SIGTERM, handle_signal as *const () as usize);
+    }
+
     let args = parse_args().unwrap_or_else(|e| {
         usage();
         eprintln!("error: {e}");
         std::process::exit(1);
     });
-    if let Err(e) = args.validate() {
-        usage();
+
+    let _socket = Socket::new(args.socket_path).unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(1);
-    }
+    });
+    let listen_fd = _socket.listen_fd();
 
-    let _keep_listener: Option<OwnedFd>;
-    let listen_fd: RawFd = match (args.socket_fd, args.socket_path) {
-        (Some(fd), None) => {
-            _keep_listener = None;
-            fd
-        }
-        (None, Some(path)) => {
-            let listener = UnixListener::bind(path).unwrap_or_else(|e| {
-                eprintln!("error: binding socket: {e}");
-                std::process::exit(1);
-            });
-            let owned = OwnedFd::from(listener);
-            let fd = owned.as_raw_fd();
-            _keep_listener = Some(owned);
-            fd
-        }
-        _ => unreachable!(),
-    };
-
-    let ready_fd = args.ready_fd.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
-
-    let mut alive_fd = None;
-    let close_fd: OwnedFd = if let Some(fd) = args.close_fd {
-        unsafe { OwnedFd::from_raw_fd(fd) }
-    } else {
-        let (r, w) = pipe().unwrap_or_else(|e| {
-            eprintln!("error: creating pipe: {e}");
-            std::process::exit(1);
-        });
-        alive_fd = Some(w);
-        OwnedFd::from(r)
-    };
+    let (_r, _w) = pipe().unwrap_or_else(|e| {
+        eprintln!("error: creating pipe: {e}");
+        std::process::exit(1);
+    });
+    let close_fd: OwnedFd = _r.into();
 
     unsafe {
         create_context(
@@ -399,15 +343,25 @@ fn main() {
         std::process::exit(1);
     });
 
-    if let Some(fd) = ready_fd {
-        File::from(fd)
-            .write_all(b"\n")
-            .unwrap_or_else(|e| eprintln!("error: writing to ready-fd: {e}"));
-    }
-
-    if alive_fd.is_some() {
-        loop {
-            std::thread::park();
+    loop {
+        let mut pfd = libc::pollfd {
+            fd: close_fd.as_raw_fd(),
+            events: libc::POLLHUP | libc::POLLERR,
+            revents: 0,
+        };
+        match unsafe { libc::poll(&mut pfd, 1, -1) } {
+            -1 => {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    if SHOULD_EXIT.load(Ordering::Acquire) {
+                        break;
+                    }
+                    continue;
+                }
+                eprintln!("error: poll failed: {err}");
+                break;
+            }
+            _ => break,
         }
     }
 }
