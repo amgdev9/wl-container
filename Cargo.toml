@@ -1,0 +1,7 @@
+[package]
+name = "wl-container"
+version = "1.0.0"
+edition = "2021"
+
+[build-dependencies]
+bindgen = "0.72.1"
